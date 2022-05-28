@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import os
 import time
 from collections import deque
 import shutil
 import paddle
-from paddleseg.utils import (TimeAverager, calculate_eta, resume, logger,
-                             worker_init_fn, train_profiler, op_flops_funs)
+from paddleseg.utils import (
+    TimeAverager, calculate_eta, resume, logger,
+    worker_init_fn, train_profiler, op_flops_funs
+)
 from .val import evaluate
 
 
@@ -39,18 +40,13 @@ def loss_computation(logits_list, labels, losses, edges=None):
         logits = logits_list[i]
         loss_i = losses['types'][i]
         coef_i = losses['coef'][i]
-
-        if loss_i.__class__.__name__ in ('BCELoss',
-                                         'FocalLoss') and loss_i.edge_label:
-            # If use edges as labels According to loss type.
-            loss_list.append(coef_i * loss_i(logits, edges))
-        elif loss_i.__class__.__name__ == 'MixedLoss':
+        if loss_i.__class__.__name__ == 'MixedLoss':
             mixed_loss_list = loss_i(logits, labels)
             for mixed_loss in mixed_loss_list:
                 loss_list.append(coef_i * mixed_loss)
         elif loss_i.__class__.__name__ in ("KLLoss", ):
-            loss_list.append(
-                coef_i * loss_i(logits_list[0], logits_list[1].detach()))
+            loss_list.append(coef_i *
+                             loss_i(logits_list[0], logits_list[1].detach()))
         else:
             loss_list.append(coef_i * loss_i(logits, labels))
     return loss_list
@@ -71,12 +67,12 @@ def train(model,
           losses=None,
           keep_checkpoint_max=5,
           test_config=None,
-          fp16=False,
+          precision='fp32',
+          amp_level='O1',
           profiler_options=None,
           to_static_training=False):
     """
     Launch training.
-
     Args:
         model（nn.Layer): A sementic segmentation model.
         train_dataset (paddle.io.Dataset): Used to read and process training datasets.
@@ -94,53 +90,52 @@ def train(model,
             The 'types' item is a list of object of paddleseg.models.losses while the 'coef' item is a list of the relevant coefficient.
         keep_checkpoint_max (int, optional): Maximum number of checkpoints to save. Default: 5.
         test_config(dict, optional): Evaluation config.
-        fp16 (bool, optional): Whether to use amp.
+        precision (str, optional): Use AMP if precision='fp16'. If precision='fp32', the training is normal.
+        amp_level (str, optional): Auto mixed precision level. Accepted values are “O1” and “O2”: O1 represent mixed precision, 
+            the input data type of each operator will be casted by white_list and black_list; O2 represent Pure fp16, all operators 
+            parameters and input data will be casted to fp16, except operators in black_list, don’t support fp16 kernel and batchnorm. Default is O1(amp)
         profiler_options (str, optional): The option of train profiler.
         to_static_training (bool, optional): Whether to use @to_static for training.
     """
     model.train()
     nranks = paddle.distributed.ParallelEnv().nranks
     local_rank = paddle.distributed.ParallelEnv().local_rank
-
     start_iter = 0
     if resume_model is not None:
         start_iter = resume(model, optimizer, resume_model)
-
     if not os.path.isdir(save_dir):
         if os.path.exists(save_dir):
             os.remove(save_dir)
         os.makedirs(save_dir)
-
+    # use amp
+    if precision == 'fp16':
+        logger.info('use AMP to train. AMP level = {}'.format(amp_level))
+        scaler = paddle.amp.GradScaler(init_loss_scaling=1024)
+        if amp_level == 'O2':
+            model, optimizer = paddle.amp.decorate(
+                models=model,
+                optimizers=optimizer,
+                level='O2',
+                save_dtype='float32')
     if nranks > 1:
         paddle.distributed.fleet.init(is_collective=True)
         optimizer = paddle.distributed.fleet.distributed_optimizer(
             optimizer)  # The return is Fleet object
         ddp_model = paddle.distributed.fleet.distributed_model(model)
-
     batch_sampler = paddle.io.DistributedBatchSampler(
         train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-
     loader = paddle.io.DataLoader(
         train_dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         return_list=True,
-        worker_init_fn=worker_init_fn,
-    )
-
-    # use amp
-    if fp16:
-        logger.info('use amp to train')
-        scaler = paddle.amp.GradScaler(init_loss_scaling=1024)
-
+        worker_init_fn=worker_init_fn, )
     if use_vdl:
         from visualdl import LogWriter
         log_writer = LogWriter(save_dir)
-
     if to_static_training:
         model = paddle.jit.to_static(model)
         logger.info("Successfully to apply @to_static")
-
     avg_loss = 0.0
     avg_loss_list = []
     iters_per_epoch = len(batch_sampler)
@@ -150,7 +145,6 @@ def train(model,
     batch_cost_averager = TimeAverager()
     save_models = deque()
     batch_start = time.time()
-
     iter = start_iter
     while iter < iters:
         for data in loader:
@@ -169,25 +163,22 @@ def train(model,
                 edges = data[2].astype('int64')
             if hasattr(model, 'data_format') and model.data_format == 'NHWC':
                 images = images.transpose((0, 2, 3, 1))
-
-            if fp16:
+            if precision == 'fp16':
                 with paddle.amp.auto_cast(
+                        level=amp_level,
                         enable=True,
                         custom_white_list={
                             "elementwise_add", "batch_norm", "sync_batch_norm"
                         },
                         custom_black_list={'bilinear_interp_v2'}):
-                    if nranks > 1:
-                        logits_list = ddp_model(images)
-                    else:
-                        logits_list = model(images)
+                    logits_list = ddp_model(images) if nranks > 1 else model(
+                        images)
                     loss_list = loss_computation(
                         logits_list=logits_list,
                         labels=labels,
                         losses=losses,
                         edges=edges)
                     loss = sum(loss_list)
-
                 scaled = scaler.scale(loss)  # scale the loss
                 scaled.backward()  # do backward
                 if isinstance(optimizer, paddle.distributed.fleet.Fleet):
@@ -195,10 +186,7 @@ def train(model,
                 else:
                     scaler.minimize(optimizer, scaled)  # update parameters
             else:
-                if nranks > 1:
-                    logits_list = ddp_model(images)
-                else:
-                    logits_list = model(images)
+                logits_list = ddp_model(images) if nranks > 1 else model(images)
                 loss_list = loss_computation(
                     logits_list=logits_list,
                     labels=labels,
@@ -211,9 +199,7 @@ def train(model,
                     optimizer.step(loss)
                 else:
                     optimizer.step()
-
             lr = optimizer.get_lr()
-
             # update lr
             if isinstance(optimizer, paddle.distributed.fleet.Fleet):
                 lr_sche = optimizer.user_defined_optimizer._learning_rate
@@ -221,9 +207,7 @@ def train(model,
                 lr_sche = optimizer._learning_rate
             if isinstance(lr_sche, paddle.optimizer.lr.LRScheduler):
                 lr_sche.step()
-
             train_profiler.add_profiler_step(profiler_options)
-
             model.clear_gradients()
             avg_loss += loss.numpy()[0]
             if not avg_loss_list:
@@ -233,7 +217,6 @@ def train(model,
                     avg_loss_list[i] += loss_list[i].numpy()
             batch_cost_averager.record(
                 time.time() - batch_start, num_samples=batch_size)
-
             if (iter) % log_iters == 0 and local_rank == 0:
                 avg_loss /= log_iters
                 avg_loss_list = [l[0] / log_iters for l in avg_loss_list]
@@ -243,9 +226,9 @@ def train(model,
                 eta = calculate_eta(remain_iters, avg_train_batch_cost)
                 logger.info(
                     "[TRAIN] epoch: {}, iter: {}/{}, loss: {:.4f}, lr: {:.6f}, batch_cost: {:.4f}, reader_cost: {:.5f}, ips: {:.4f} samples/sec | ETA {}"
-                    .format((iter - 1) // iters_per_epoch + 1, iter, iters,
-                            avg_loss, lr, avg_train_batch_cost,
-                            avg_train_reader_cost,
+                    .format((iter - 1
+                             ) // iters_per_epoch + 1, iter, iters, avg_loss,
+                            lr, avg_train_batch_cost, avg_train_reader_cost,
                             batch_cost_averager.get_ips_average(), eta))
                 if use_vdl:
                     log_writer.add_scalar('Train/loss', avg_loss, iter)
@@ -257,7 +240,6 @@ def train(model,
                         for key, value in avg_loss_dict.items():
                             log_tag = 'Train/' + key
                             log_writer.add_scalar(log_tag, value, iter)
-
                     log_writer.add_scalar('Train/lr', lr, iter)
                     log_writer.add_scalar('Train/batch_cost',
                                           avg_train_batch_cost, iter)
@@ -267,17 +249,13 @@ def train(model,
                 avg_loss_list = []
                 reader_cost_averager.reset()
                 batch_cost_averager.reset()
-
-            if (iter % save_interval == 0
-                    or iter == iters) and (val_dataset is not None):
+            if (iter % save_interval == 0 or
+                    iter == iters) and (val_dataset is not None):
                 num_workers = 1 if num_workers > 0 else 0
-
                 if test_config is None:
                     test_config = {}
-
                 metrics = evaluate(
                     model, val_dataset, num_workers=num_workers, **test_config)
-
                 if len(metrics) == 9:
                     miou, accuracy, precison, recall, false_alarm, \
                     missing_alarm, F1, kappa, mdice = metrics
@@ -285,9 +263,7 @@ def train(model,
                 else:
                     miou, accuracy, precison, recall, false_alarm, \
                     missing_alarm, F1, kappa, mdice, auc_roc = metrics
-
                 model.train()
-
             if (iter % save_interval == 0 or iter == iters) and local_rank == 0:
                 current_save_dir = os.path.join(save_dir,
                                                 "iter_{}".format(iter))
@@ -301,7 +277,6 @@ def train(model,
                 if len(save_models) > keep_checkpoint_max > 0:
                     model_to_remove = save_models.popleft()
                     shutil.rmtree(model_to_remove)
-
                 if val_dataset is not None:
                     if miou > best_mean_iou:
                         best_mean_iou = miou
@@ -313,9 +288,8 @@ def train(model,
                     logger.info(
                         '[EVAL] The model with the best validation mIoU ({:.4f}) was saved at iter {}.'
                         .format(best_mean_iou, best_model_iter))
-
                     if use_vdl:
-                        log_writer.add_scalar('Evaluate/mIoU', miou, iter)
+                        log_writer.add_scalar('Evaluate/IoU', miou, iter)
                         log_writer.add_scalar('Evaluate/Accuracy', accuracy, iter)
                         log_writer.add_scalar('Evaluate/Precison', precison, iter)
                         log_writer.add_scalar('Evaluate/Recall', recall, iter)
@@ -323,18 +297,16 @@ def train(model,
                         log_writer.add_scalar('Evaluate/MissingAlarm', missing_alarm, iter)
                         log_writer.add_scalar('Evaluate/F1', F1, iter)
                         log_writer.add_scalar('Evaluate/kappa', kappa, iter)
-                        log_writer.add_scalar('Evaluate/mDice', mdice, iter)
+                        log_writer.add_scalar('Evaluate/Dice', mdice, iter)
                         if auc_roc is not None:
                             log_writer.add_scalar('Evaluate/AUC', auc_roc, iter)
             batch_start = time.time()
-
     # Calculate flops.
-    if local_rank == 0:
+    if local_rank == 0 and not (precision == 'fp16' and amp_level == 'O2'):
         _, c, h, w = images.shape
         _ = paddle.flops(
             model, [1, c, h, w],
             custom_ops={paddle.nn.SyncBatchNorm: op_flops_funs.count_syncbn})
-
     # Sleep for half a second to let dataloader release resources.
     time.sleep(0.5)
     if use_vdl:
