@@ -39,7 +39,7 @@ def evaluate(model,
              amp_level='O1',
              num_workers=0,
              print_detail=True,
-             auc_roc=False):
+             auc_roc=True):
     """
     Launch evalution.
     Args:
@@ -239,9 +239,9 @@ def evaluate(model,
     kappa = cal_kappa(TP_area_all, pred_area_all, label_area_all)
     _, mdice = cal_dice(TP_area_all, pred_area_all, label_area_all)
     if auc_roc:
-        auc_roc = cal_auc_roc(
+        auc = cal_auc_roc(
             logits_all, label_all, num_classes=eval_dataset.num_classes)
-        auc_infor = ' Auc_roc: {:.4f}'.format(auc_roc)
+        auc_infor = ' Auc: {:.4f}'.format(auc)
     if print_detail:
         infor = "[EVAL] #Images: {} mIoU: {:.4f} ".format(len(eval_dataset), miou) + \
                 "Accuracy: {:.4f} Precison: {:.4f} ".format(accuracy, precison) + \
@@ -252,6 +252,6 @@ def evaluate(model,
         logger.info(infor)
     if auc_roc:
         return miou, accuracy, precison, recall, false_alarm, \
-               missing_alarm, F1, kappa, mdice, auc_roc
+               missing_alarm, F1, kappa, mdice, auc
     else:
         return miou, accuracy, precison, recall, false_alarm, missing_alarm, F1, kappa, mdice

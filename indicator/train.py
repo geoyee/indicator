@@ -52,6 +52,7 @@ def loss_computation(logits_list, labels, losses, edges=None):
     return loss_list
 
 
+
 def train(model,
           train_dataset,
           val_dataset=None,
@@ -289,7 +290,7 @@ def train(model,
                         '[EVAL] The model with the best validation mIoU ({:.4f}) was saved at iter {}.'
                         .format(best_mean_iou, best_model_iter))
                     if use_vdl:
-                        log_writer.add_scalar('Evaluate/IoU', miou, iter)
+                        log_writer.add_scalar('Evaluate/mIoU', miou, iter)
                         log_writer.add_scalar('Evaluate/Accuracy', accuracy, iter)
                         log_writer.add_scalar('Evaluate/Precison', precison, iter)
                         log_writer.add_scalar('Evaluate/Recall', recall, iter)
@@ -297,7 +298,7 @@ def train(model,
                         log_writer.add_scalar('Evaluate/MissingAlarm', missing_alarm, iter)
                         log_writer.add_scalar('Evaluate/F1', F1, iter)
                         log_writer.add_scalar('Evaluate/kappa', kappa, iter)
-                        log_writer.add_scalar('Evaluate/Dice', mdice, iter)
+                        log_writer.add_scalar('Evaluate/mDice', mdice, iter)
                         if auc_roc is not None:
                             log_writer.add_scalar('Evaluate/AUC', auc_roc, iter)
             batch_start = time.time()
